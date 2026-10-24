@@ -26,6 +26,7 @@ class DatosEntrada(BaseModel):
     lluvia_om: Optional[float] = None
     rocio_om: Optional[float] = None
     radiacion_est: Optional[float] = None
+    viento_om: Optional[float] = None  # Agregado para evitar error 500
 
 
 @app.post("/predecir")
@@ -33,8 +34,10 @@ def predecir(datos: DatosEntrada):
     # Convertir a DataFrame respetando el orden exacto de features del modelo
     df = pd.DataFrame([datos.dict()])[features]
 
-    # Random Forest maneja NaN de forma nativa: los valores nulos se ignoran
-    # al buscar las divisiones en los árboles
+    # Escudo 1: Rellenar nulos con 0 para que Scikit-learn no falle en la predicción
+    df = df.fillna(0)
+
+    # Escudo 2: Forzar a tipo float por si Pydantic lo recibió como int o string
     df = df.astype(float)
 
     # Predecir el error de temperatura
