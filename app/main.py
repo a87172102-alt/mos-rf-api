@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from typing import Optional
 import joblib
 import json
+import math
 import pandas as pd
 import numpy as np
 
@@ -35,6 +36,32 @@ DESCRIPCION_WMO = {
     80: "Chubascos ligeros", 81: "Chubascos moderados", 82: "Chubascos fuertes",
     95: "Tormenta", 96: "Tormenta con granizo", 99: "Tormenta fuerte con granizo",
 }
+
+# ------------------------------------------------------------------
+# Posición solar: para inferir día/noche sin que n8n lo envíe.
+# Mismo criterio que el entrenamiento (toa_om > 50 W/m2 ~ sol > 2°).
+# ------------------------------------------------------------------
+LAT = -32.13
+LON = -64.36
+TZ_OFFSET = -3.0        # America/Argentina/Cordoba (sin horario de verano)
+ELEV_MIN_DEG = 2.0
+
+
+def _ecuacion_tiempo(n: int) -> float:
+    """Ecuación del tiempo en minutos (aproximación estándar)."""
+    b = math.radians(360.0 * (n - 81) / 364.0)
+    return 9.87 * math.sin(2 * b) - 7.53 * math.cos(b) - 1.5 * math.sin(b)
+
+
+def _elevacion_solar(hora_local: float, dia_del_ano: int) -> float:
+    """Elevación del sol en grados para la ubicación de la estación."""
+    hora_utc = hora_local - TZ_OFFSET
+    hora_solar = hora_utc + LON / 15.0 + _ecuacion_tiempo(dia_del_ano) / 60.0
+    h = math.radians(15.0 * (hora_solar - 12.0))
+    delta = math.radians(-23.44 * math.cos(math.radians(360.0 * (dia_del_ano + 10) / 365.0)))
+    phi = math.radians(LAT)
+    cos_z = math.sin(phi) * math.sin(delta) + math.cos(phi) * math.cos(delta) * math.cos(h)
+    return math.degrees(math.asin(min(max(cos_z, -1.0), 1.0)))
 
 
 class DatosEntrada(BaseModel):
@@ -100,11 +127,19 @@ def _preparar(features, valores: dict, sentinels: Optional[dict] = None):
 
 
 def _es_de_dia(datos) -> int:
+    """1 = día, 0 = noche. Orden de prioridad:
+    1. es_de_dia explícito (opcional, p.ej. is_day de Open-Meteo)
+    2. toa_om (la radiación TOA ya codifica la posición solar)
+    3. luz del luxómetro
+    4. cálculo de elevación solar con hora_del_dia + dia_del_ano
+    """
     if datos.es_de_dia is not None:
         return int(datos.es_de_dia)
     if datos.toa_om is not None:
         return int(datos.toa_om > 50)
-    return int((datos.luz or 0) > 0)
+    if (datos.luz or 0) > 0:
+        return 1
+    return int(_elevacion_solar(datos.hora_del_dia, datos.dia_del_ano) > ELEV_MIN_DEG)
 
 
 def _kt_observado(luz, toa_om):
