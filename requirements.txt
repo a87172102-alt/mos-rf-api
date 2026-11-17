@@ -1,6 +1,8 @@
 fastapi
 uvicorn[standard]
-scikit-learn
-pandas
-numpy
-joblib
+# Versiones fijadas a las del entorno de entrenamiento:
+# los .pkl de models/ deben cargarse con la misma versión de scikit-learn.
+scikit-learn==1.9.1
+numpy==2.4.6
+pandas==3.0.6
+joblib==1.6.0
