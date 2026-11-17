@@ -7,7 +7,7 @@ import math
 import pandas as pd
 import numpy as np
 
-app = FastAPI(title="MOS-RF API", version="2.0")
+app = FastAPI(title="MOS-RF API", version="2.1")
 
 # ------------------------------------------------------------------
 # Cargar modelos y features al arrancar
@@ -23,10 +23,18 @@ with open('models/modelo_features_nubosidad.json') as f:
 with open('models/modelo_features_lluvia.json') as f:
     features_lluvia = json.load(f)
 
-# Constante de calibración del luxómetro (generada por el entrenamiento):
-# csi crudo = luz[lx] / toa_om[W/m2]; kt = csi / K_DESPEJADO -> 1.0 = despejado
+# Calibración del luxómetro (generada por el entrenamiento):
+# csi crudo = luz[lx] / toa_om[W/m2]; la referencia de cielo despejado es una
+# ENVELOPENTE EMPÍRICA csi_despejado(cos_zenit) del propio sensor (el BH1750
+# no ve el sol directo a sol bajo y se satura en el mediodía, así que la
+# referencia no es una constante ni una exponencial).
+# kt = csi / csi_despejado(cos_zenit) -> ~1.0 = despejado a cualquier hora.
 with open('models/k_despejado.json') as f:
-    K_DESPEJADO = json.load(f)['k_despejado']
+    K_CAL = json.load(f)
+COS_Z_TABLA = np.array(K_CAL['cos_zenit'], dtype=float)
+CSI_TABLA = np.array(K_CAL['csi_despejado'], dtype=float)
+TECHO_LUX = float(K_CAL.get('techo_lux', 54612.5))
+TECHO_RAD_EST = TECHO_LUX * 0.0079   # techo del sensor en unidades de la feature
 
 DESCRIPCION_WMO = {
     0: "Despejado", 1: "Mayormente despejado", 2: "Parcialmente nublado",
@@ -38,13 +46,12 @@ DESCRIPCION_WMO = {
 }
 
 # ------------------------------------------------------------------
-# Posición solar: para inferir día/noche sin que n8n lo envíe.
-# Mismo criterio que el entrenamiento (toa_om > 50 W/m2 ~ sol > 2°).
+# Posición solar para la ubicación de la estación.
 # ------------------------------------------------------------------
-LAT = -32.13
-LON = -64.36
+LAT = float(K_CAL.get('lat', -32.13))
+LON = float(K_CAL.get('lon', -64.36))
 TZ_OFFSET = -3.0        # America/Argentina/Cordoba (sin horario de verano)
-ELEV_MIN_DEG = 2.0
+COS_Z_MIN = 0.10        # debajo: noche/crepúsculo (kt = -1, sentinel)
 
 
 def _ecuacion_tiempo(n: int) -> float:
@@ -53,22 +60,26 @@ def _ecuacion_tiempo(n: int) -> float:
     return 9.87 * math.sin(2 * b) - 7.53 * math.cos(b) - 1.5 * math.sin(b)
 
 
-def _elevacion_solar(hora_local: float, dia_del_ano: int) -> float:
-    """Elevación del sol en grados para la ubicación de la estación."""
+def _cos_zenit(hora_local: float, dia_del_ano: int) -> float:
+    """Coseno del ángulo cenital solar para la ubicación de la estación."""
     hora_utc = hora_local - TZ_OFFSET
     hora_solar = hora_utc + LON / 15.0 + _ecuacion_tiempo(dia_del_ano) / 60.0
     h = math.radians(15.0 * (hora_solar - 12.0))
     delta = math.radians(-23.44 * math.cos(math.radians(360.0 * (dia_del_ano + 10) / 365.0)))
     phi = math.radians(LAT)
-    cos_z = math.sin(phi) * math.sin(delta) + math.cos(phi) * math.cos(delta) * math.cos(h)
-    return math.degrees(math.asin(min(max(cos_z, -1.0), 1.0)))
+    return math.sin(phi) * math.sin(delta) + math.cos(phi) * math.cos(delta) * math.cos(h)
+
+
+def _csi_despejado(cos_z: float) -> float:
+    """Envolvente empírica interpolada (np.interp recorta fuera de rango)."""
+    return float(np.interp(cos_z, COS_Z_TABLA, CSI_TABLA))
 
 
 class DatosEntrada(BaseModel):
     # Features obligatorias (siempre deben venir)
     temp_om: float
     humedad_om: float
-    hora_del_dia: int
+    hora_del_dia: int      # hora LOCAL
     dia_del_ano: int
 
     # Features opcionales del pronóstico
@@ -77,12 +88,15 @@ class DatosEntrada(BaseModel):
     precipitacion_om: Optional[float] = None
     rocio_om: Optional[float] = None
     viento_om: Optional[float] = None
+    radiacion_om: Optional[float] = None
 
-    # Luminosidad de la estación (hora actual): luz en lx, toa_om en W/m2
+    # Luminosidad de la estación (solo hora actual): luz en lx, toa_om en W/m2
+    # de la misma hora física. Para horas futuras NO enviar radiacion_est:
+    # la API la estima con la envolvente y el kt predicho.
     radiacion_est: Optional[float] = None
     luz: Optional[float] = None
     toa_om: Optional[float] = None
-    # 1 = día, 0 = noche. Si no viene se infiere de toa_om/luz.
+    # 1 = día, 0 = noche. Si no viene se infiere de la posición solar.
     es_de_dia: Optional[int] = None
 
 
@@ -94,7 +108,7 @@ class EstadoEntrada(BaseModel):
     - Hora futura (pronóstico): omitir 'luz' -> kt predicho con
       modelo_nubosidad a partir del pronóstico de Open-Meteo.
     """
-    hora_del_dia: int
+    hora_del_dia: int      # hora LOCAL
     dia_del_ano: int
     nubosidad_om: Optional[float] = None
 
@@ -126,34 +140,36 @@ def _preparar(features, valores: dict, sentinels: Optional[dict] = None):
     return df.astype(float)
 
 
-def _es_de_dia(datos) -> int:
-    """1 = día, 0 = noche. Orden de prioridad:
+def _es_de_dia(datos, cos_z: float) -> int:
+    """1 = día, 0 = noche. Prioridad:
     1. es_de_dia explícito (opcional, p.ej. is_day de Open-Meteo)
-    2. toa_om (la radiación TOA ya codifica la posición solar)
-    3. luz del luxómetro
-    4. cálculo de elevación solar con hora_del_dia + dia_del_ano
+    2. posición solar (cos_zenit > 0.10 ~ elevación > 5.7°)
     """
     if datos.es_de_dia is not None:
         return int(datos.es_de_dia)
-    if datos.toa_om is not None:
-        return int(datos.toa_om > 50)
-    if (datos.luz or 0) > 0:
-        return 1
-    return int(_elevacion_solar(datos.hora_del_dia, datos.dia_del_ano) > ELEV_MIN_DEG)
+    return int(cos_z > COS_Z_MIN)
 
 
-def _kt_observado(luz, toa_om):
-    """kt medido por el luxómetro, o None si no hay lectura de día."""
-    if luz is None or toa_om is None or toa_om <= 50 or luz <= 0:
+def _kt_observado(luz, toa_om, cos_z: float):
+    """kt medido por el luxómetro, o None si no hay lectura válida de día.
+
+    Requiere sol sobre el horizonte (cos_z > 0.10) y lectura positiva.
+    Si el sensor está saturado (techo del BH1750), el valor es un límite
+    inferior: el clip a 1.3 lo lleva igual al rango 'despejado'.
+    """
+    if luz is None or toa_om is None or toa_om <= 0 or luz <= 0:
         return None
-    return float(min(max((luz / toa_om) / K_DESPEJADO, 0.0), 1.2))
+    if cos_z <= COS_Z_MIN:
+        return None
+    csi = luz / toa_om
+    return float(min(max(csi / _csi_despejado(cos_z), 0.0), 1.3))
 
 
 def _kt_predicho(valores: dict) -> float:
     """kt pronosticado por el modelo de nubosidad a partir de Open-Meteo."""
     X = _preparar(features_nub, valores)
     kt = float(modelo_nub.predict(X)[0])
-    return float(min(max(kt, 0.0), 1.2))
+    return float(min(max(kt, 0.0), 1.3))
 
 
 def _prob_lluvia(valores: dict) -> float:
@@ -163,27 +179,49 @@ def _prob_lluvia(valores: dict) -> float:
     return float(proba[clases.index(1)] if 1 in clases else proba[-1])
 
 
-def sugerir_estado(kt: float, prob_lluvia: float, nubosidad_om=None) -> int:
-    """Combina kt (1.0 = despejado) y prob. de lluvia en un código WMO."""
+def sugerir_estado(kt: float, prob_lluvia: float, nubosidad_om=None,
+                   es_de_dia: int = 1) -> int:
+    """Combina kt (1.0 = despejado según el sensor) y prob. de lluvia en WMO.
+
+    Umbrales calibrados con la envolvente empírica del sensor:
+    horas despejadas ~0.88 de kt medio, cielo cubierto ~0.60.
+    De noche el luxómetro no informa: se usa la nubosidad de Open-Meteo.
+    """
     if prob_lluvia >= 0.6:
         return 63 if prob_lluvia >= 0.85 else 61   # lluvia moderada / leve
-    if kt < 0.08 and prob_lluvia >= 0.3:
-        return 51                                   # llovizna
+
+    if not es_de_dia:
+        nub = nubosidad_om if nubosidad_om is not None else 40
+        if nub >= 85:
+            return 3                                # cubierto
+        if nub >= 40:
+            return 2                                # parcialmente nublado
+        if nub >= 10:
+            return 1                                # mayormente despejado
+        return 0                                    # despejado
+
     if kt >= 0.95:
         return 0                                    # despejado
-    if kt >= 0.75:
+    if kt >= 0.72:
         return 1                                    # mayormente despejado
-    if kt >= 0.50:
-        return 2                                    # parcialmente nublado
     if nubosidad_om is not None and nubosidad_om >= 85:
         return 3                                    # cubierto
+    if kt >= 0.45:
+        return 2                                    # parcialmente nublado
+    # Zona ambigua (kt 0.30-0.45): puede ser cielo despejado con el sensor
+    # obstruido a sol bajo. Open-Meteo desempata: poco nubosidad -> despejado.
+    if kt >= 0.30 and nubosidad_om is not None and nubosidad_om <= 25:
+        return 1                                    # mayormente despejado
+    if kt < 0.25 and prob_lluvia >= 0.35:
+        return 51                                   # llovizna (muy oscuro)
     return 2
 
 
 @app.post("/predecir")
 def predecir(datos: DatosEntrada):
-    dia = _es_de_dia(datos)
-    kt_obs = _kt_observado(datos.luz, datos.toa_om)
+    cos_z = _cos_zenit(datos.hora_del_dia, datos.dia_del_ano)
+    dia = _es_de_dia(datos, cos_z)
+    kt_obs = _kt_observado(datos.luz, datos.toa_om, cos_z)
 
     if kt_obs is not None:
         kt = kt_obs
@@ -194,6 +232,19 @@ def predecir(datos: DatosEntrada):
         kt = -1.0  # noche (sentinel igual que en el entrenamiento)
 
     valores = {**datos.dict(), 'kt': kt, 'es_de_dia': dia}
+
+    # radiacion_est de horas futuras: lo que el sensor marcaría con ese kt
+    # a esa posición solar: csi_despejado(cos_z) * kt * toa_om * 0.0079,
+    # limitado al techo del luxómetro. Sin toa_om, cae al factor mediano.
+    if valores.get('radiacion_est') is None and kt >= 0:
+        toa = valores.get('toa_om') or 0
+        if toa > 0:
+            proxy = _csi_despejado(cos_z) * kt * toa * 0.0079
+        else:
+            proxy = (valores.get('radiacion_om') or 0) \
+                * float(K_CAL.get('factor_lux_om', 13.9)) * 0.0079
+        valores['radiacion_est'] = float(min(max(proxy, 0.0), TECHO_RAD_EST))
+
     df = _preparar(features_temp, valores, sentinels={'kt': -1.0})
 
     error_predicho = float(modelo_temp.predict(df)[0])
@@ -206,13 +257,17 @@ def predecir(datos: DatosEntrada):
         "kt": None if kt < 0 else round(kt, 3),
         "kt_observado": kt_obs is not None,
         "es_de_dia": dia,
+        "cos_zenit": round(cos_z, 3),
+        "radiacion_est_usada": valores.get('radiacion_est'),
     }
 
 
 @app.post("/estado")
 def estado(datos: EstadoEntrada):
-    dia = _es_de_dia(datos)
-    kt_obs = _kt_observado(datos.luz, datos.toa_om)
+    cos_z = _cos_zenit(datos.hora_del_dia, datos.dia_del_ano)
+    dia = _es_de_dia(datos, cos_z)
+    kt_obs = _kt_observado(datos.luz, datos.toa_om, cos_z)
+    saturado = bool(datos.luz is not None and datos.luz >= TECHO_LUX - 1)
     valores = {**datos.dict(), 'es_de_dia': dia}
 
     if kt_obs is not None:
@@ -224,13 +279,15 @@ def estado(datos: EstadoEntrada):
 
     valores['kt'] = kt
     prob = _prob_lluvia(valores)
-    wmo = sugerir_estado(kt, prob, datos.nubosidad_om)
+    wmo = sugerir_estado(kt, prob, datos.nubosidad_om, dia)
 
     return {
         "kt": None if kt < 0 else round(kt, 3),
         "kt_observado": fuente == "observado",
         "fuente_kt": fuente,
+        "sensor_saturado": saturado,
         "es_de_dia": dia,
+        "cos_zenit": round(cos_z, 3),
         "prob_lluvia": round(prob, 3),
         "nubosidad_om": datos.nubosidad_om,
         "estado_wmo": wmo,
@@ -242,7 +299,14 @@ def estado(datos: EstadoEntrada):
 def health():
     return {
         "status": "ok",
-        "k_despejado": K_DESPEJADO,
+        "version": "2.1",
+        "calibracion": {
+            "modelo": K_CAL.get('modelo'),
+            "cos_zenit": K_CAL.get('cos_zenit'),
+            "csi_despejado": K_CAL.get('csi_despejado'),
+            "techo_lux": TECHO_LUX,
+            "n": K_CAL.get('n'),
+        },
         "modelos": {
             "temperatura": {"features": features_temp, "n_features": len(features_temp)},
             "nubosidad": {"features": features_nub, "n_features": len(features_nub)},
